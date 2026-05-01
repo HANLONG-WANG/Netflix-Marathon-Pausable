@@ -410,7 +410,11 @@ const methods = {
       this.clk(store);
       return;
     }
-    if ((store = document.querySelector(".watch-video--skip-content-button"))) {
+    if (
+      (store = document.querySelector(
+        ".watch-video--skip-content-button, [data-uia='player-skip-intro']"
+      ))
+    ) {
       // skip intro, recap, etc.
       this.clk(store);
       return;
