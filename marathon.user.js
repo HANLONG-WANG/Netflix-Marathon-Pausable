@@ -10,7 +10,7 @@
 // @name:ru            Netflix Marathon (пауза)
 // @name:hi            नेटफ्लिक्स मैराथन (रोकने योग्य)
 // @namespace          https://github.com/aminomancer
-// @version            5.8.5
+// @version            5.8.6
 // @description        A configurable script that automatically skips recaps, intros, credits, and ads, and clicks "next episode" prompts on Netflix, Amazon Prime Video, Hulu, HBO Max, Starz, Disney+, and Hotstar. Customizable hotkey to pause/resume the auto-skipping functionality. Alt + N for settings.
 // @description:en     A configurable script that automatically skips recaps, intros, credits, and ads, and clicks "next episode" prompts on Netflix, Amazon Prime Video, Hulu, HBO Max, Starz, Disney+, and Hotstar. Customizable hotkey to pause/resume the auto-skipping functionality. Alt + N for settings.
 // @description:zh-CN  一个可配置的脚本，可自动跳过重述、介绍、演职员表和广告，并点击 Netflix、Amazon Prime Video、Hulu、HBO Max、Starz、Disney+ 和 Hotstar 上的“下一集”提示。 可自定义的热键暂停/恢复自动跳过功能。 Alt + N 进行设置。
@@ -372,12 +372,14 @@ const methods = {
     }
   },
   netflix() {
+    netflixControls.ensure();
     if (this.skips !== 0) {
       this.skips -= 1;
       return;
     }
     let store;
     if (
+      netflixControls.shouldSkipEnding() &&
       options.watchCredits !== "true" &&
       (store = document.querySelector(
         "[data-uia='next-episode-seamless-button-draining'], [data-uia='next-episode-seamless-button']"
@@ -385,10 +387,22 @@ const methods = {
     ) {
       // next episode button
       this.reactFiber(store)?.memoizedProps.onClick?.();
+      netflixControls.consumeOneTime("ending", store, true);
       this.skips = 5;
       return;
     }
     if (
+      !netflixControls.shouldSkipEnding() &&
+      (store = document.querySelector(
+        "[data-uia='next-episode-seamless-button-draining'], [data-uia='next-episode-seamless-button']"
+      ))
+    ) {
+      netflixControls.consumeOneTime("ending", store, false);
+      this.skips = 5;
+      return;
+    }
+    if (
+      netflixControls.shouldSkipEnding() &&
       options.watchCredits === "true" &&
       (store = document.querySelector(
         "[data-uia='watch-credits-seamless-button']"
@@ -396,10 +410,22 @@ const methods = {
     ) {
       // watch credits button
       this.reactFiber(store)?.memoizedProps.onClick?.();
+      netflixControls.consumeOneTime("ending", store, true);
       this.skips = 10;
       return;
     }
     if (
+      !netflixControls.shouldSkipEnding() &&
+      (store = document.querySelector(
+        "[data-uia='watch-credits-seamless-button']"
+      ))
+    ) {
+      netflixControls.consumeOneTime("ending", store, false);
+      this.skips = 10;
+      return;
+    }
+    if (
+      netflixControls.shouldSkipEnding() &&
       options.promoted &&
       options.watchCredits !== "true" &&
       (store = document.querySelector(
@@ -408,21 +434,57 @@ const methods = {
     ) {
       // promoted video autoplay
       this.clk(store);
+      netflixControls.consumeOneTime("ending", store, true);
       return;
     }
     if (
+      !netflixControls.shouldSkipEnding() &&
+      options.promoted &&
+      options.watchCredits !== "true" &&
+      (store = document.querySelector(
+        ".PromotedVideo-actions"
+      )?.firstElementChild)
+    ) {
+      netflixControls.consumeOneTime("ending", store, false);
+      this.skips = 5;
+      return;
+    }
+    if (
+      netflixControls.shouldSkipIntro() &&
       (store = document.querySelector(
         ".watch-video--skip-content-button, [data-uia='player-skip-intro']"
       ))
     ) {
       // skip intro, recap, etc.
       this.clk(store);
+      netflixControls.consumeOneTime("intro", store, true);
       return;
     }
-    if ((store = document.querySelector(".watch-video--skip-preplay-button"))) {
+    if (
+      !netflixControls.shouldSkipIntro() &&
+      (store = document.querySelector(
+        ".watch-video--skip-content-button, [data-uia='player-skip-intro']"
+      ))
+    ) {
+      netflixControls.consumeOneTime("intro", store, false);
+      this.skips = 5;
+      return;
+    }
+    if (
+      netflixControls.shouldSkipIntro() &&
+      (store = document.querySelector(".watch-video--skip-preplay-button"))
+    ) {
       // not sure what this does but I found this while trying to reverse
       // engineer the source code. please inform me if you know
       this.clk(store);
+      netflixControls.consumeOneTime("intro", store, true);
+    }
+    if (
+      !netflixControls.shouldSkipIntro() &&
+      (store = document.querySelector(".watch-video--skip-preplay-button"))
+    ) {
+      netflixControls.consumeOneTime("intro", store, false);
+      this.skips = 5;
     }
   },
   disneyplus() {
@@ -636,6 +698,448 @@ const methods = {
   },
 };
 
+const netflixControls = {
+  storage: {
+    skipIntro: "Marathon:netflixSkipIntro",
+    skipEnding: "Marathon:netflixSkipEnding",
+  },
+  defaults: {
+    skipIntro: true,
+    skipEnding: true,
+  },
+  labels: {
+    skipIntro: "跳过开头",
+    skipEnding: "跳过结尾",
+    oneTime: "仅本次生效",
+  },
+  promptSelectors: {
+    intro:
+      ".watch-video--skip-content-button, [data-uia='player-skip-intro'], .watch-video--skip-preplay-button",
+    ending:
+      "[data-uia='next-episode-seamless-button-draining'], [data-uia='next-episode-seamless-button'], [data-uia='watch-credits-seamless-button'], .PromotedVideo-actions > *",
+  },
+  values: null,
+  tempValues: null,
+  oneTime: false,
+  oneTimeBase: null,
+  sessionBase: null,
+  blocked: {
+    intro: null,
+    ending: null,
+  },
+
+  start(controller) {
+    this.controller = controller;
+    this.load();
+    this.ensure();
+    this.timer = window.setInterval(() => this.ensure(), 1000);
+  },
+
+  load() {
+    if (this.values) return;
+    this.values = {};
+    for (const [key, fallback] of Object.entries(this.defaults)) {
+      const value = GM_getValue(this.storage[key], fallback);
+      this.values[key] = value !== false && value !== "false";
+    }
+  },
+
+  effective(key) {
+    this.load();
+    return this.oneTime ? this.tempValues[key] : this.values[key];
+  },
+
+  shouldSkipIntro() {
+    return !this.isBlocked("intro") && this.effective("skipIntro");
+  },
+
+  shouldSkipEnding() {
+    return !this.isBlocked("ending") && this.effective("skipEnding");
+  },
+
+  beginSession() {
+    if (!this.oneTime) this.sessionBase = { ...this.values };
+  },
+
+  endSession() {
+    if (!this.oneTime) this.sessionBase = null;
+  },
+
+  getDisplayedValues() {
+    return {
+      skipIntro: this.inputs?.skipIntro?.checked ?? this.effective("skipIntro"),
+      skipEnding:
+        this.inputs?.skipEnding?.checked ?? this.effective("skipEnding"),
+    };
+  },
+
+  setStoredValues(values) {
+    for (const [key, value] of Object.entries(values)) {
+      this.values[key] = value;
+      GM_setValue(this.storage[key], value);
+    }
+  },
+
+  setOneTime(enabled) {
+    if (enabled === this.oneTime) return;
+    if (enabled) {
+      const displayed = this.getDisplayedValues();
+      this.oneTimeBase = this.sessionBase || { ...this.values };
+      this.setStoredValues(this.oneTimeBase);
+      this.tempValues = displayed;
+      this.oneTime = true;
+    } else {
+      this.restoreOneTime();
+    }
+    this.sync();
+  },
+
+  restoreOneTime() {
+    if (!this.oneTime) return;
+    this.setStoredValues(this.oneTimeBase);
+    this.tempValues = null;
+    this.oneTimeBase = null;
+    this.oneTime = false;
+    this.sessionBase = null;
+  },
+
+  updateSetting(key, value) {
+    this.load();
+    if (this.oneTime) {
+      this.tempValues[key] = value;
+    } else {
+      this.setStoredValues({ [key]: value });
+    }
+    this.sync();
+  },
+
+  consumeOneTime(type, element, didSkip) {
+    if (!this.oneTime) return;
+    const disabled = !this.effective(type === "intro" ? "skipIntro" : "skipEnding");
+    this.restoreOneTime();
+    if (!didSkip || disabled) this.block(type, element);
+    this.sync();
+  },
+
+  block(type, element) {
+    this.blocked[type] = {
+      element,
+      expires: Date.now() + 10 * 60 * 1000,
+    };
+  },
+
+  isBlocked(type) {
+    const block = this.blocked[type];
+    if (!block) return false;
+    if (Date.now() > block.expires || !this.findPrompt(type)) {
+      this.blocked[type] = null;
+      return false;
+    }
+    return true;
+  },
+
+  findPrompt(type) {
+    const selector = this.promptSelectors[type];
+    return [...document.querySelectorAll(selector)].find(element =>
+      this.isVisible(element)
+    );
+  },
+
+  isVisible(element) {
+    if (!element) return false;
+    try {
+      const { display, visibility } = getComputedStyle(element);
+      return (
+        display !== "none" &&
+        !["hidden", "collapse"].includes(visibility) &&
+        !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+      );
+    } catch (e) {
+      return false;
+    }
+  },
+
+  ensure() {
+    if (site !== "netflix" || !document.body) return;
+    this.load();
+    this.ensureStyle();
+    this.ensureElements();
+    const target = this.findInsertTarget();
+    if (!target) return;
+    this.syncButtonSize(target.button);
+    if (this.shell.parentElement !== target.parent) {
+      target.parent.insertBefore(this.shell, target.before);
+    } else if (target.before && this.shell.nextElementSibling !== target.before) {
+      target.parent.insertBefore(this.shell, target.before);
+    }
+    this.sync();
+  },
+
+  findInsertTarget() {
+    const findButtonByLabel = labels =>
+      [...document.querySelectorAll("button, [role='button']")].find(element => {
+        if (this.shell?.contains(element) || !this.isVisible(element)) return false;
+        const text = `${element.getAttribute("aria-label") || ""} ${
+          element.textContent || ""
+        }`;
+        return labels.some(label => text.toLowerCase().includes(label));
+      });
+    const getLabeledTarget = labels => {
+      const button = findButtonByLabel(labels);
+      return button?.parentElement ? this.getButtonInsertTarget(button) : null;
+    };
+    const nextSelectors = [
+      "[data-uia='control-next']",
+      "[data-uia='player-control-button-next-episode']",
+      "[data-uia='next-episode-button']",
+      "button[aria-label*='Next Episode' i]",
+      "button[aria-label*='Next episode' i]",
+      "button[aria-label*='下一集']",
+      "button[aria-label*='次のエピソード']",
+    ];
+    const labeledNextTarget = getLabeledTarget([
+      "next episode",
+      "下一集",
+      "次のエピソード",
+      "suivant",
+      "siguiente",
+      "nächste",
+    ]);
+    if (labeledNextTarget) return labeledNextTarget;
+    for (const selector of nextSelectors) {
+      const nextButton = document.querySelector(selector);
+      if (
+        nextButton?.parentElement &&
+        !this.shell.contains(nextButton) &&
+        this.isVisible(nextButton)
+      ) {
+        return this.getButtonInsertTarget(nextButton);
+      }
+    }
+
+    const episodesTarget = getLabeledTarget([
+      "episodes",
+      "剧集",
+      "エピソード",
+      "épisodes",
+      "episodios",
+      "folgen",
+    ]);
+    if (episodesTarget) return episodesTarget;
+
+    const fallbackSelectors = [
+      ".watch-video--right-controls",
+      "[data-uia='player-controls']",
+      ".watch-video--bottom-controls-container",
+    ];
+    for (const selector of fallbackSelectors) {
+      const parent = document.querySelector(selector);
+      if (parent instanceof HTMLElement && this.isVisible(parent)) {
+        return {
+          parent,
+          before: null,
+        };
+      }
+    }
+    return null;
+  },
+
+  getButtonInsertTarget(button) {
+    let before = button;
+    let parent = button.parentElement;
+    while (parent?.parentElement && parent !== document.body) {
+      const visibleButtons = [...parent.querySelectorAll("button, [role='button']")]
+        .filter(element => !this.shell?.contains(element) && this.isVisible(element));
+      if (visibleButtons.length !== 1) break;
+      before = parent;
+      parent = parent.parentElement;
+    }
+    return {
+      parent,
+      before,
+      button,
+    };
+  },
+
+  syncButtonSize(button) {
+    if (!button || !this.shell) return;
+    const rect = button.getBoundingClientRect();
+    const width = Math.max(34, Math.round(rect.width));
+    const height = Math.max(34, Math.round(rect.height));
+    const fontSize = Math.max(24, Math.min(36, Math.round(height * 0.68)));
+    this.shell.style.setProperty("--marathon-netflix-control-width", `${width}px`);
+    this.shell.style.setProperty(
+      "--marathon-netflix-control-height",
+      `${height}px`
+    );
+    this.shell.style.setProperty(
+      "--marathon-netflix-control-font-size",
+      `${fontSize}px`
+    );
+  },
+
+  ensureElements() {
+    if (this.shell) return;
+    this.shell = document.createElement("span");
+    this.shell.id = "MarathonNetflixControlShell";
+    this.shell.addEventListener("mouseenter", () => this.beginSession());
+    this.shell.addEventListener("mouseleave", () => this.endSession());
+    this.shell.addEventListener("focusin", () => this.beginSession());
+    this.shell.addEventListener("focusout", () => this.endSession());
+    for (const eventName of ["pointerdown", "mousedown", "click", "keydown"]) {
+      this.shell.addEventListener(eventName, event => event.stopPropagation());
+    }
+
+    this.button = document.createElement("button");
+    this.button.id = "MarathonNetflixToggle";
+    this.button.type = "button";
+    this.button.textContent = "M";
+    this.button.addEventListener("click", event => {
+      event.preventDefault();
+      this.controller?.toggle();
+      window.setTimeout(() => this.sync(), 0);
+    });
+
+    this.menu = document.createElement("div");
+    this.menu.id = "MarathonNetflixMenu";
+    this.menu.setAttribute("role", "menu");
+    this.inputs = {
+      skipIntro: this.createCheckbox("skipIntro"),
+      skipEnding: this.createCheckbox("skipEnding"),
+      oneTime: this.createCheckbox("oneTime"),
+    };
+
+    this.shell.appendChild(this.button);
+    this.shell.appendChild(this.menu);
+  },
+
+  createCheckbox(key) {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.addEventListener("change", () => {
+      if (key === "oneTime") this.setOneTime(input.checked);
+      else this.updateSetting(key, input.checked);
+    });
+    label.appendChild(input);
+    label.appendChild(document.createTextNode(this.labels[key]));
+    this.menu.appendChild(label);
+    return input;
+  },
+
+  ensureStyle() {
+    if (this.style) return;
+    this.style = document.createElement("style");
+    this.style.id = "MarathonNetflixControlStyle";
+    this.style.textContent = `
+#MarathonNetflixControlShell {
+  align-items: center !important;
+  display: inline-flex !important;
+  justify-content: center !important;
+  margin: 0 14px 0 4px !important;
+  position: relative !important;
+  vertical-align: middle !important;
+  z-index: 2147483645 !important;
+  --marathon-netflix-control-width: 34px;
+  --marathon-netflix-control-height: 34px;
+  --marathon-netflix-control-font-size: 13px;
+}
+#MarathonNetflixToggle {
+  align-items: center !important;
+  appearance: none !important;
+  background: transparent !important;
+  border: 0 !important;
+  border-radius: 4px !important;
+  box-shadow: none !important;
+  color: white !important;
+  cursor: pointer !important;
+  display: inline-flex !important;
+  font: 800 calc(var(--marathon-netflix-control-font-size) * 1.18)/1 Arial, sans-serif !important;
+  height: var(--marathon-netflix-control-height) !important;
+  justify-content: center !important;
+  letter-spacing: 0 !important;
+  margin: 0 !important;
+  min-height: var(--marathon-netflix-control-height) !important;
+  min-width: var(--marathon-netflix-control-width) !important;
+  opacity: 1 !important;
+  padding: 0 !important;
+  text-transform: none !important;
+  width: var(--marathon-netflix-control-width) !important;
+}
+#MarathonNetflixToggle[data-state="paused"] {
+  background: transparent !important;
+  color: #e50914 !important;
+}
+#MarathonNetflixToggle[data-state="running"] {
+  background: transparent !important;
+  color: white !important;
+}
+#MarathonNetflixToggle:hover,
+#MarathonNetflixToggle:focus-visible {
+  background: hsla(0, 0%, 100%, 0.12) !important;
+  outline: none !important;
+}
+#MarathonNetflixMenu {
+  background: hsla(0, 0%, 7%, 0.94) !important;
+  border: 1px solid hsla(0, 0%, 100%, 0.18) !important;
+  border-radius: 8px !important;
+  bottom: calc(100% - 1px) !important;
+  box-shadow: 0 12px 34px hsla(0, 0%, 0%, 0.48) !important;
+  color: white !important;
+  display: grid !important;
+  font: 500 13px/1.35 Arial, sans-serif !important;
+  gap: 8px !important;
+  min-width: 132px !important;
+  opacity: 0 !important;
+  padding: 10px !important;
+  pointer-events: none !important;
+  position: absolute !important;
+  right: 0 !important;
+  text-align: left !important;
+  transform: translateY(4px) !important;
+  transition: opacity 120ms ease, transform 120ms ease !important;
+  white-space: nowrap !important;
+}
+#MarathonNetflixControlShell:hover #MarathonNetflixMenu,
+#MarathonNetflixControlShell:focus-within #MarathonNetflixMenu {
+  opacity: 1 !important;
+  pointer-events: auto !important;
+  transform: translateY(0) !important;
+}
+#MarathonNetflixMenu label {
+  align-items: center !important;
+  color: white !important;
+  cursor: pointer !important;
+  display: flex !important;
+  gap: 7px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  text-transform: none !important;
+}
+#MarathonNetflixMenu input {
+  accent-color: #e50914 !important;
+  cursor: pointer !important;
+  height: 14px !important;
+  margin: 0 !important;
+  min-height: 14px !important;
+  min-width: 14px !important;
+  width: 14px !important;
+}`;
+    document.head.appendChild(this.style);
+  },
+
+  sync() {
+    if (!this.button || !this.inputs) return;
+    const running = this.controller?.pauseState === MarathonController.STATES.RUNNING;
+    this.button.dataset.state = running ? "running" : "paused";
+    this.button.title = running ? "Pause Marathon" : "Resume Marathon";
+    this.button.setAttribute("aria-label", this.button.title);
+    this.inputs.skipIntro.checked = this.effective("skipIntro");
+    this.inputs.skipEnding.checked = this.effective("skipEnding");
+    this.inputs.oneTime.checked = this.oneTime;
+  },
+};
+
 // creates an interval for a given callback manager (the methods object) and the
 // various methods for interacting with the interval (pause, resume, etc.) and
 // the popup that shows when the interval has been paused or resumed.
@@ -662,6 +1166,7 @@ class MarathonController {
     GM_addValueChangeListener("Marathon:paused", this.onPauseChange);
     // if popup is enabled in options, style it
     if (options.pop) this.updatePopup();
+    if (site === "netflix") netflixControls.start(this);
     this.time = Date.now();
     switch (this.pauseState) {
       case MarathonController.STATES.RUNNING:
@@ -778,6 +1283,7 @@ class MarathonController {
    */
   async onPauseChange(name, oldValue, newValue) {
     this._pauseState = newValue;
+    if (site === "netflix") netflixControls.sync();
     if (oldValue === newValue || !options[site]) return;
     switch (newValue) {
       case MarathonController.STATES.RUNNING:
